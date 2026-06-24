@@ -449,12 +449,28 @@ def _make_delete_cmd(kind: str, regex, label: str):
         if len(parts) < 2 or not regex.match(parts[1]):
             await update.message.reply_text(f"Uso: /{label} <id>")
             return ConversationHandler.END
-        context.user_data["del"] = {"kind": kind, "id": parts[1]}
+        target = parts[1]
+        if kind == "post":
+            # Restringe a posts publicados PELA sabiá (app-owned). A sabiá já rejeita o resto com
+            # 404, mas validar aqui dá um "não" imediato e claro, antes mesmo de confirmar.
+            import asyncio
+            try:
+                posts = await asyncio.to_thread(Sabia().list_posts)
+            except Exception as exc:  # noqa: BLE001 - rede/backend fora do ar
+                await update.message.reply_text(f"Não consegui consultar os posts da sabiá: {exc}")
+                return ConversationHandler.END
+            if target not in {p.get("shortcode") for p in posts}:
+                await update.message.reply_text(
+                    f"❌ '{target}' não está entre os posts publicados pela sabiá — só dá pra "
+                    "excluir o que foi criado por aqui. Use /posts pra ver os shortcodes."
+                )
+                return ConversationHandler.END
+        context.user_data["del"] = {"kind": kind, "id": target}
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ Excluir", callback_data="del:yes"),
             InlineKeyboardButton("❌ Não", callback_data="del:no"),
         ]])
-        await update.message.reply_text(f"Confirmar exclusão de {kind} {parts[1]}?", reply_markup=kb)
+        await update.message.reply_text(f"Confirmar exclusão de {kind} {target}?", reply_markup=kb)
         return D_CONFIRM
 
     return _start

@@ -31,6 +31,36 @@ echo "==> fila Cloud Tasks ($QUEUE)"
 gcloud tasks queues describe "$QUEUE" --location="$REGION" >/dev/null 2>&1 \
   || gcloud tasks queues create "$QUEUE" --location="$REGION"
 
+echo "==> service account de runtime + IAM (idempotente)"
+gcloud iam service-accounts describe "$RUNTIME_SA" >/dev/null 2>&1 \
+  || gcloud iam service-accounts create "${RUNTIME_SA%%@*}" --display-name="pedalbot Cloud Run runtime"
+
+# Garante o service agent do Cloud Tasks (ele cunha o token OIDC na entrega) e pega o nº do projeto.
+gcloud beta services identity create --service=cloudtasks.googleapis.com >/dev/null 2>&1 || true
+PROJECT_NUMBER="$(gcloud projects describe "$PROJECT" --format='value(projectNumber)')"
+TASKS_AGENT="service-${PROJECT_NUMBER}@gcp-sa-cloudtasks.iam.gserviceaccount.com"
+
+# Papéis no projeto: estado das conversas (Firestore) + enfileirar no Cloud Tasks.
+for ROLE in roles/datastore.user roles/cloudtasks.enqueuer; do
+  gcloud projects add-iam-policy-binding "$PROJECT" \
+    --member="serviceAccount:${RUNTIME_SA}" --role="$ROLE" --condition=None >/dev/null
+done
+
+# Ler os segredos montados nos dois serviços.
+for S in telegram-bot-token telegram-webhook-secret sabia-app-password; do
+  gcloud secrets add-iam-policy-binding "$S" \
+    --member="serviceAccount:${RUNTIME_SA}" --role="roles/secretmanager.secretAccessor" \
+    --condition=None >/dev/null
+done
+
+# OIDC do Cloud Tasks → worker. SEM ISTO o /anuncio trava em "Processando…" (create_task dá 403):
+#  - o webhook roda como phbot-run e CRIA a task com oidc_token de phbot-run → actAs em si mesmo;
+#  - o agente do Cloud Tasks CUNHA o token na entrega → tokenCreator sobre phbot-run.
+gcloud iam service-accounts add-iam-policy-binding "$RUNTIME_SA" \
+  --member="serviceAccount:${RUNTIME_SA}" --role="roles/iam.serviceAccountUser" --condition=None >/dev/null
+gcloud iam service-accounts add-iam-policy-binding "$RUNTIME_SA" \
+  --member="serviceAccount:${TASKS_AGENT}" --role="roles/iam.serviceAccountTokenCreator" --condition=None >/dev/null
+
 SECRETS="TELEGRAM_BOT_TOKEN=telegram-bot-token:latest,TELEGRAM_WEBHOOK_SECRET=telegram-webhook-secret:latest,SABIA_APP_PASSWORD=sabia-app-password:latest"
 ENVS="GCP_PROJECT=${PROJECT},GCP_REGION=${REGION},CLOUD_TASKS_QUEUE=${QUEUE},AMORA_BASE_URL=${AMORA_BASE_URL},SABIA_BASE_URL=${SABIA_BASE_URL},TELEGRAM_ALLOWED_USERS=${ALLOWED},FIRESTORE_PREFIX=phbot_"
 
@@ -65,4 +95,5 @@ echo "    -d allowed_updates='[\"message\",\"callback_query\"]'"
 echo "  # allowed_updates é OBRIGATÓRIO: sem callback_query os cliques nos botões inline não"
 echo "  # chegam (ficam em 'Loading…'). Omitir mantém a assinatura anterior — confira com getWebhookInfo."
 echo
-echo "IAM extra p/ a runtime SA: roles/datastore.user (Firestore) e roles/cloudtasks.enqueuer."
+echo "SA + IAM (Firestore, Cloud Tasks, secrets, OIDC) já aplicados acima. Após o setWebhook,"
+echo "mande um /anuncio de teste; se travar em 'Processando…', cheque os logs do ph-bot-webhook."

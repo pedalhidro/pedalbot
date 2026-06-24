@@ -1,0 +1,24 @@
+# pedalbot — Telegram bot (sabiá Instagram + amora censo)
+# Sistema (não-pip): ffmpeg, exiftool  →  brew install ffmpeg exiftool
+
+# Telegram
+python-telegram-bot[job-queue]>=21,<22
+
+# HTTP para os backends (sabiá + amora)
+httpx>=0.27
+
+# Mídia: pHash/vHash (DCT) + variantes de imagem + HEIC do iPhone
+Pillow>=10.3
+pillow-heif>=0.16
+numpy>=1.26
+
+# RDF/Turtle: construção dos fragmentos + validação local
+rdflib>=7.0
+
+# Cloud Run (primário): receptor de webhook + worker de Cloud Tasks
+fastapi>=0.110
+uvicorn[standard]>=0.29
+
+# GCP: estado das conversas (Firestore) + offload do trabalho lento (Cloud Tasks)
+google-cloud-firestore>=2.16
+google-cloud-tasks>=2.16

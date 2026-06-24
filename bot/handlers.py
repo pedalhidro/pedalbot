@@ -104,24 +104,29 @@ def _parse_dt(text: str) -> "str | None":
 # ── comandos simples ─────────────────────────────────────────────────────────
 @restricted
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🐦 *pedalbot* — Pedal Hidrográfico\n\n"
-        "/anuncio — compor e publicar post no Instagram (sabiá)\n"
-        "/passeio — cadastrar passeio no censo (amora)\n"
-        "/subir\\_midia — subir foto/vídeo geolocalizado pro mapa\n"
-        "/posts — listar posts publicados\n"
-        "/excluir\\_foto · /excluir\\_video · /excluir\\_passeio\n"
-        "/ajuda · /cancelar",
-        parse_mode="Markdown",
-    )
+    linhas = [
+        "🐦 *pedalbot* — Pedal Hidrográfico\n",
+        "/anuncio — compor e publicar post no Instagram (sabiá)",
+        "/posts — listar posts publicados",
+        "/excluir\\_post — remover um post do Instagram (com confirmação)",
+    ]
+    if Config.AMORA_ENABLED:
+        linhas += [
+            "/passeio — cadastrar passeio no censo (amora)",
+            "/subir\\_midia — subir foto/vídeo geolocalizado pro mapa",
+            "/excluir\\_foto · /excluir\\_video · /excluir\\_passeio",
+        ]
+    linhas.append("/ajuda · /cancelar")
+    await update.message.reply_text("\n".join(linhas), parse_mode="Markdown")
 
 
 @restricted
 async def cmd_ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Cada comando abre um passo-a-passo. Use /cancelar pra abortar.\n"
-        "Mídia pro mapa: envie como ARQUIVO (não foto comprimida) e com GPS — senão o amora rejeita."
-    )
+    txt = "Cada comando abre um passo-a-passo. Use /cancelar pra abortar."
+    if Config.AMORA_ENABLED:
+        txt += ("\nMídia pro mapa: envie como ARQUIVO (não foto comprimida) e com GPS — "
+                "senão o amora rejeita.")
+    await update.message.reply_text(txt)
 
 
 @restricted
@@ -266,17 +271,7 @@ async def passeio_route(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def passeio_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.text != "/pular":
         context.user_data["tour"]["description"] = update.message.text or ""
-    await update.message.reply_text("👥 Quantos participantes? (número) ou /pular")
-    return P_ATTEND
-
-
-async def passeio_attend(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.text != "/pular":
-        try:
-            context.user_data["tour"]["count_attendee"] = int((update.message.text or "").strip())
-        except ValueError:
-            await update.message.reply_text("Número inválido. Tente de novo ou /pular")
-            return P_ATTEND
+    # (pergunta "Quantos participantes?" removida — count_attendee é opcional no TTL/SHACL)
     await update.message.reply_text("⚡ Energia estimada (kJ)? (a intensidade é derivada) ou /pular")
     return P_ENERGY
 
@@ -519,6 +514,20 @@ async def orphan_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         pass
 
 
+async def fallback_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Mensagem não reconhecida (fora de qualquer wizard) → orienta o usuário.
+
+    Vai por ÚLTIMO no grupo 0 (depois de comandos e conversas): dentro do grupo só o 1º handler
+    que casa roda, então só cai aqui o que nenhum outro tratou. Silencioso p/ quem não está na
+    allowlist (não vira beacon p/ estranhos)."""
+    uid = update.effective_user.id if update.effective_user else None
+    if not Config.is_allowed(uid):
+        return
+    msg = update.effective_message
+    if msg:
+        await msg.reply_text("Não entendi 🤔 Mande /start para ver as opções.")
+
+
 # ── registro ─────────────────────────────────────────────────────────────────
 def register(app: Application) -> None:
     fallbacks = [CommandHandler("cancelar", cmd_cancelar)]
@@ -548,45 +557,49 @@ def register(app: Application) -> None:
         allow_reentry=True,
     ))
 
-    app.add_handler(ConversationHandler(
-        entry_points=[CommandHandler("passeio", passeio_start)],
-        states={
-            P_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, passeio_title)],
-            P_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, passeio_date)],
-            P_SERIES: [CommandHandler("pular", passeio_series),
-                      MessageHandler(filters.TEXT & ~filters.COMMAND, passeio_series)],
-            P_ROUTE: [CommandHandler("pular", passeio_route),
-                     MessageHandler(filters.TEXT & ~filters.COMMAND, passeio_route)],
-            P_DESC: [CommandHandler("pular", passeio_desc),
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, passeio_desc)],
-            P_ATTEND: [CommandHandler("pular", passeio_attend),
-                      MessageHandler(filters.TEXT & ~filters.COMMAND, passeio_attend)],
-            P_ENERGY: [CommandHandler("pular", passeio_energy),
-                      MessageHandler(filters.TEXT & ~filters.COMMAND, passeio_energy)],
-            P_INSTA: [CallbackQueryHandler(passeio_insta_choice, pattern=r"^insta:")],
-            P_INSTA_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, passeio_insta_url)],
-            P_INSTA_IMG: [MessageHandler(filters.PHOTO | filters.Document.IMAGE, passeio_insta_img)],
-        },
-        fallbacks=fallbacks, conversation_timeout=timeout, name="passeio", persistent=_PERSIST,
-        allow_reentry=True,
-    ))
+    # Features do amora (passeio, subir_midia, exclusões do mapa/censo) — atrás da flag
+    # AMORA_ENABLED. Default OFF: o bot expõe só o fluxo do Instagram (sabiá).
+    if Config.AMORA_ENABLED:
+        app.add_handler(ConversationHandler(
+            entry_points=[CommandHandler("passeio", passeio_start)],
+            states={
+                P_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, passeio_title)],
+                P_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, passeio_date)],
+                P_SERIES: [CommandHandler("pular", passeio_series),
+                          MessageHandler(filters.TEXT & ~filters.COMMAND, passeio_series)],
+                P_ROUTE: [CommandHandler("pular", passeio_route),
+                         MessageHandler(filters.TEXT & ~filters.COMMAND, passeio_route)],
+                P_DESC: [CommandHandler("pular", passeio_desc),
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, passeio_desc)],
+                P_ENERGY: [CommandHandler("pular", passeio_energy),
+                          MessageHandler(filters.TEXT & ~filters.COMMAND, passeio_energy)],
+                P_INSTA: [CallbackQueryHandler(passeio_insta_choice, pattern=r"^insta:")],
+                P_INSTA_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, passeio_insta_url)],
+                P_INSTA_IMG: [MessageHandler(filters.PHOTO | filters.Document.IMAGE, passeio_insta_img)],
+            },
+            fallbacks=fallbacks, conversation_timeout=timeout, name="passeio", persistent=_PERSIST,
+            allow_reentry=True,
+        ))
 
-    app.add_handler(ConversationHandler(
-        entry_points=[CommandHandler("subir_midia", midia_start)],
-        states={
-            M_COLLECT: [CommandHandler("pronto", midia_pronto),
-                       MessageHandler(filters.Document.ALL | filters.VIDEO | filters.PHOTO, midia_collect)],
-            M_TOUR: [CommandHandler("pular", midia_tour),
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, midia_tour)],
-        },
-        fallbacks=fallbacks, conversation_timeout=timeout, name="subir_midia", persistent=_PERSIST,
-        allow_reentry=True,
-    ))
+        app.add_handler(ConversationHandler(
+            entry_points=[CommandHandler("subir_midia", midia_start)],
+            states={
+                M_COLLECT: [CommandHandler("pronto", midia_pronto),
+                           MessageHandler(filters.Document.ALL | filters.VIDEO | filters.PHOTO, midia_collect)],
+                M_TOUR: [CommandHandler("pular", midia_tour),
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, midia_tour)],
+            },
+            fallbacks=fallbacks, conversation_timeout=timeout, name="subir_midia", persistent=_PERSIST,
+            allow_reentry=True,
+        ))
 
-    for kind, label, rx in (("foto", "excluir_foto", _PHASH_RE),
-                            ("video", "excluir_video", _PHASH_RE),
-                            ("passeio", "excluir_passeio", _TOURID_RE),
-                            ("post", "excluir_post", re.compile(r"^.+$"))):
+    # Exclusões: /excluir_post (sabiá) sempre; foto/vídeo/passeio (amora) só com a flag.
+    delete_kinds = [("post", "excluir_post", re.compile(r"^.+$"))]
+    if Config.AMORA_ENABLED:
+        delete_kinds = [("foto", "excluir_foto", _PHASH_RE),
+                        ("video", "excluir_video", _PHASH_RE),
+                        ("passeio", "excluir_passeio", _TOURID_RE)] + delete_kinds
+    for kind, label, rx in delete_kinds:
         app.add_handler(ConversationHandler(
             entry_points=[CommandHandler(label, _make_delete_cmd(kind, rx, label))],
             states={D_CONFIRM: [CallbackQueryHandler(delete_confirm, pattern=r"^del:")]},
@@ -594,11 +607,13 @@ def register(app: Application) -> None:
             allow_reentry=True,
         ))
 
-    # Por ÚLTIMO no grupo 0: rede de segurança que responde botões órfãos (estado da conversa
-    # perdido por restart/timeout/troca de instância). Dentro do grupo, só o 1º handler que casa
-    # roda — então as conversas acima têm prioridade quando o estado existe; só o que sobrou cai
-    # aqui. Sem isto, um botão sem conversa fica em "Loading…" pra sempre.
+    # Por ÚLTIMO no grupo 0: redes de segurança. Dentro do grupo só o 1º handler que casa roda,
+    # então as conversas acima têm prioridade; aqui só cai o que ninguém tratou:
+    #  - órfão de callback (botão sem conversa) → responde e limpa o "Loading…";
+    #  - mensagem desconhecida → orienta o usuário a mandar /start.
+    # Não registre nada depois destes dois.
     app.add_handler(CallbackQueryHandler(orphan_callback))
+    app.add_handler(MessageHandler(filters.ALL, fallback_unknown))
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:

@@ -50,6 +50,10 @@ class Config:
     SABIA_BASE_URL = os.environ.get("SABIA_BASE_URL", "http://localhost:8080").rstrip("/")
     SABIA_APP_PASSWORD = os.environ.get("SABIA_APP_PASSWORD", "")
     AMORA_BASE_URL = os.environ.get("AMORA_BASE_URL", "https://amora.pedalhidrografi.co").rstrip("/")
+    # Feature flag: esconde os comandos do amora (/passeio, /subir_midia, exclusões do mapa/censo)
+    # quando desligado. Default OFF — o bot expõe só o fluxo do Instagram (sabiá). Ligue com
+    # AMORA_ENABLED=true (env ou .env) p/ testar/reativar. Toggle sem rebuild no Cloud Run.
+    AMORA_ENABLED = os.environ.get("AMORA_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
 
     # ── GCP / Cloud Run ───────────────────────────────────────────────────
     GCP_PROJECT = os.environ.get("GCP_PROJECT", "pedal-hidrografico")

@@ -228,7 +228,8 @@ def test_orphan_callback() -> None:
     os.environ.setdefault("TELEGRAM_ALLOWED_USERS", "1")
     warnings.simplefilter("ignore")  # silencia o PTBUserWarning de per_message
     from telegram import CallbackQuery, Chat, Message, Update, User
-    from telegram.ext import ApplicationBuilder, CallbackQueryHandler, ConversationHandler
+    from telegram.ext import (ApplicationBuilder, CallbackQueryHandler, ConversationHandler,
+                              MessageHandler)
     from telegram.request import BaseRequest
 
     from bot import handlers as H
@@ -260,14 +261,17 @@ def test_orphan_callback() -> None:
             return 200, ('{"ok":true,"result":' + json.dumps(res) + "}").encode()
 
     async def run() -> None:
+        Config.ALLOWED_USERS = frozenset({1})  # o user de teste (id=1) precisa passar no gate
         fr = FakeRequest()
         app = (ApplicationBuilder().token(Config.TELEGRAM_BOT_TOKEN or "123456:DUMMY")
                .request(fr).get_updates_request(FakeRequest()).build())
         H.register(app)
-        last = app.handlers[0][-1]
-        check("catch-all é o ÚLTIMO handler do grupo 0",
-              isinstance(last, CallbackQueryHandler) and not isinstance(last, ConversationHandler)
-              and last.pattern is None)
+        grp0 = app.handlers[0]
+        check("fallback de mensagem é o ÚLTIMO handler do grupo 0",
+              isinstance(grp0[-1], MessageHandler) and not isinstance(grp0[-1], ConversationHandler))
+        check("catch-all de callback órfão vem logo antes (sem pattern)",
+              isinstance(grp0[-2], CallbackQueryHandler) and not isinstance(grp0[-2], ConversationHandler)
+              and grp0[-2].pattern is None)
         await app.initialize()
         u, c = User(id=1, first_name="t", is_bot=False), Chat(id=1, type="private")
         msg = Message(message_id=9, date=datetime.datetime.now(datetime.timezone.utc),
@@ -282,6 +286,17 @@ def test_orphan_callback() -> None:
             await app.process_update(upd)
             check(f"callback órfão '{data}' é respondido (answerCallbackQuery)",
                   "answerCallbackQuery" in fr.api[n:])
+
+        # mensagem desconhecida (texto sem comando, fora de conversa) → fallback orienta /start
+        m2 = Message(message_id=10, date=datetime.datetime.now(datetime.timezone.utc),
+                     chat=c, from_user=u, text="qualquer coisa aleatória")
+        m2.set_bot(app.bot)
+        upd2 = Update(update_id=2, message=m2)
+        upd2.set_bot(app.bot)
+        n = len(fr.api)
+        await app.process_update(upd2)
+        check("mensagem desconhecida recebe resposta do fallback (sendMessage)",
+              "sendMessage" in fr.api[n:])
         await app.shutdown()
 
     asyncio.run(run())

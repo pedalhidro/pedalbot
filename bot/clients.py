@@ -31,7 +31,14 @@ def _body(resp: httpx.Response) -> dict:
     try:
         return resp.json()
     except Exception:  # noqa: BLE001
-        return {"text": resp.text[:600]}
+        # Resposta não-JSON: tipicamente uma página de erro de gateway (Cloudflare 5xx) que
+        # esconde o corpo real do backend. Resume em vez de despejar o HTML inteiro pro usuário.
+        ct = (resp.headers.get("content-type") or "").lower()
+        text = resp.text or ""
+        if "html" in ct or text.lstrip()[:1] == "<":
+            return {"error": f"backend indisponível (HTTP {resp.status_code}; resposta de gateway, "
+                             "não-JSON) — instabilidade ou credencial do backend"}
+        return {"text": text[:600]}
 
 
 def _check(resp: httpx.Response) -> dict:

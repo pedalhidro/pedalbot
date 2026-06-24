@@ -105,7 +105,7 @@ def _parse_dt(text: str) -> "str | None":
 @restricted
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     linhas = [
-        "🐦 *pedalbot* — Pedal Hidrográfico\n",
+        "*digestor do censo hidrográfico*\n",
         "/anuncio — compor e publicar post no Instagram (sabiá)",
         "/posts — listar posts publicados",
         "/excluir\\_post — remover um post do Instagram (com confirmação)",

@@ -331,6 +331,7 @@ class _FakeRequest(_BaseRequest):  # responde getMe/sendMessage/etc. localmente 
     def __init__(self) -> None:
         super().__init__()
         self.api: list[str] = []
+        self.calls: list[tuple] = []  # (método, parâmetros) p/ inspecionar texto/markup
 
     async def initialize(self) -> None: ...
     async def shutdown(self) -> None: ...
@@ -340,6 +341,7 @@ class _FakeRequest(_BaseRequest):  # responde getMe/sendMessage/etc. localmente 
         m = url.rsplit("/", 1)[-1]
         p = request_data.parameters if request_data else {}
         self.api.append(m)
+        self.calls.append((m, p))
         if m == "getMe":
             res: object = {"id": 1, "is_bot": True, "first_name": "b", "username": "phbot"}
         elif m in ("sendMessage", "editMessageText", "editMessageReplyMarkup"):
@@ -512,6 +514,68 @@ def test_password_access() -> None:
     asyncio.run(run())
 
 
+# ── 10. /excluir_post sem arg propõe a lista de posts excluíveis ──────────────
+def test_delete_post_picker() -> None:
+    """/excluir_post SEM shortcode deve propor os posts excluíveis (app-owned) como botões;
+    tocar num → confirmar → excluir. Posts não-app-owned (sem `deletable`) não aparecem."""
+    import asyncio
+    import warnings
+
+    warnings.simplefilter("ignore")
+    os.environ.pop("WORKER_URL", None)
+    os.environ.pop("K_SERVICE", None)
+    os.environ["AMORA_ENABLED"] = ""
+
+    from telegram import CallbackQuery, Update, User
+
+    from bot import clients as C, handlers as H
+    from bot.config import Config
+
+    print("/excluir_post sem arg → picker de posts:")
+    Config.ALLOWED_USERS = frozenset({1})
+    Config.WORKER_URL = ""
+    H._PERSIST = False
+    deleted: list[str] = []
+    C.Sabia.list_posts = lambda self: [
+        {"shortcode": "ABC123", "deletable": True, "likes": 5, "comments": 1},
+        {"shortcode": "XYZ999", "deletable": True},
+        {"shortcode": "OLDPST", "deletable": False},  # não app-owned
+    ]
+    C.Sabia.delete_post = lambda self, sc: (deleted.append(sc), {"ok": True})[1]
+
+    async def run() -> None:
+        app, fr = _build_app()
+        await app.initialize()
+
+        upd = Update(update_id=1, message=_cmd_msg(app.bot, 1, "/excluir_post"))
+        upd.set_bot(app.bot)
+        await app.process_update(upd)
+        picker = next((p for (m, p) in fr.calls if m == "sendMessage" and "Qual post" in str(p.get("text", ""))), None)
+        markup = str(picker.get("reply_markup")) if picker else ""
+        check("propõe o post excluível ABC123 como botão", "del:pick:ABC123" in markup)
+        check("não oferece post não-app-owned (OLDPST)", "del:pick:OLDPST" not in markup)
+
+        # toca no XYZ999 → confirma
+        cq = CallbackQuery(id="c1", from_user=User(id=1, first_name="t", is_bot=False),
+                           chat_instance="ci", data="del:pick:XYZ999", message=_cmd_msg(app.bot, 9, "Qual post excluir?"))
+        cq.set_bot(app.bot)
+        u2 = Update(update_id=2, callback_query=cq)
+        u2.set_bot(app.bot)
+        await app.process_update(u2)
+
+        # confirma (del:yes) → exclui
+        cq2 = CallbackQuery(id="c2", from_user=User(id=1, first_name="t", is_bot=False),
+                            chat_instance="ci", data="del:yes", message=_cmd_msg(app.bot, 9, "Confirmar exclusão de post XYZ999?"))
+        cq2.set_bot(app.bot)
+        u3 = Update(update_id=3, callback_query=cq2)
+        u3.set_bot(app.bot)
+        await app.process_update(u3)
+        check("escolher no picker + confirmar exclui o post certo", deleted == ["XYZ999"], f"deleted={deleted}")
+        await app.shutdown()
+
+    asyncio.run(run())
+
+
 if __name__ == "__main__":
     test_compile()
     test_hashing()
@@ -522,6 +586,7 @@ if __name__ == "__main__":
     test_polling_subscription()
     test_webhook_conversation_reload()
     test_password_access()
+    test_delete_post_picker()
     print()
     if _failures:
         print(f"\033[31m{_failures} verificação(ões) falharam\033[0m")

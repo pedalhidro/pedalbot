@@ -48,6 +48,7 @@ _PERSIST = Config.using_cloud_run()
 (M_COLLECT, M_TOUR) = range(15, 17)
 (D_CONFIRM,) = range(17, 18)
 (P_INSTA_IMG,) = range(18, 19)  # coleta da arte quando o IG é "publicar agora"
+(D_PICK,) = range(19, 20)  # /excluir_post sem arg: escolher o post numa lista de botões
 
 _PHASH_RE = re.compile(r"^[0-9a-f]{16}$")
 _TOURID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -144,7 +145,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*digestor do censo hidrográfico*\n",
         "/anuncio — compor e publicar post no Instagram (sabiá)",
         "/posts — listar posts publicados",
-        "/excluir\\_post — remover um post do Instagram (com confirmação)",
+        "/excluir\\_post — remover um post do Instagram (sem argumento, mostra a lista pra escolher)",
     ]
     if Config.AMORA_ENABLED:
         linhas += [
@@ -478,38 +479,75 @@ async def cmd_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+def _confirm_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Excluir", callback_data="del:yes"),
+        InlineKeyboardButton("❌ Não", callback_data="del:no"),
+    ]])
+
+
 def _make_delete_cmd(kind: str, regex, label: str):
     @restricted
     async def _start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        import asyncio
+
         parts = (update.message.text or "").split()
-        if len(parts) < 2 or not regex.match(parts[1]):
-            await update.message.reply_text(f"Uso: /{label} <id>")
-            return ConversationHandler.END
-        target = parts[1]
+        has_arg = len(parts) >= 2 and bool(regex.match(parts[1]))
+
         if kind == "post":
-            # Restringe a posts publicados PELA sabiá (app-owned). A sabiá já rejeita o resto com
-            # 404, mas validar aqui dá um "não" imediato e claro, antes mesmo de confirmar.
-            import asyncio
+            # Precisamos da lista da sabiá em ambos os casos: validar o arg OU montar o picker.
+            # Só posts app-owned (`deletable`) podem ser removidos — a sabiá rejeita o resto (404).
             try:
                 posts = await asyncio.to_thread(Sabia().list_posts)
             except Exception as exc:  # noqa: BLE001 - rede/backend fora do ar
                 await update.message.reply_text(f"Não consegui consultar os posts da sabiá: {exc}")
                 return ConversationHandler.END
+
+            if not has_arg:
+                # Sem shortcode: propõe a lista de posts excluíveis como botões (um por post).
+                deletable = [p for p in posts if p.get("deletable")]
+                if not deletable:
+                    await update.message.reply_text(
+                        "Nenhum post excluível por aqui — só dá pra remover o que a sabiá publicou "
+                        "(app-owned). Veja /posts (os marcados com 🗑️)."
+                    )
+                    return ConversationHandler.END
+                rows = [[InlineKeyboardButton(
+                    f"{p.get('shortcode')} ❤{p.get('likes', 0)} 💬{p.get('comments', 0)}",
+                    callback_data=f"del:pick:{p.get('shortcode')}")] for p in deletable[:10]]
+                rows.append([InlineKeyboardButton("❌ Cancelar", callback_data="del:no")])
+                await update.message.reply_text("Qual post excluir?", reply_markup=InlineKeyboardMarkup(rows))
+                return D_PICK
+
+            target = parts[1]
             if target not in {p.get("shortcode") for p in posts}:
                 await update.message.reply_text(
                     f"❌ '{target}' não está entre os posts publicados pela sabiá — só dá pra "
                     "excluir o que foi criado por aqui. Use /posts pra ver os shortcodes."
                 )
                 return ConversationHandler.END
+        else:
+            # foto/vídeo/passeio (amora): sem endpoint de listagem aqui, então exige o id.
+            if not has_arg:
+                await update.message.reply_text(f"Uso: /{label} <id>")
+                return ConversationHandler.END
+            target = parts[1]
+
         context.user_data["del"] = {"kind": kind, "id": target}
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Excluir", callback_data="del:yes"),
-            InlineKeyboardButton("❌ Não", callback_data="del:no"),
-        ]])
-        await update.message.reply_text(f"Confirmar exclusão de {kind} {target}?", reply_markup=kb)
+        await update.message.reply_text(f"Confirmar exclusão de {kind} {target}?", reply_markup=_confirm_kb())
         return D_CONFIRM
 
     return _start
+
+
+async def delete_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Post escolhido no picker (`del:pick:<shortcode>`) → pede confirmação."""
+    q = update.callback_query
+    await q.answer()
+    shortcode = q.data.split(":", 2)[2]
+    context.user_data["del"] = {"kind": "post", "id": shortcode}
+    await q.edit_message_text(f"Confirmar exclusão de post {shortcode}?", reply_markup=_confirm_kb())
+    return D_CONFIRM
 
 
 async def delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -703,9 +741,14 @@ def register(app: Application) -> None:
                         ("video", "excluir_video", _PHASH_RE),
                         ("passeio", "excluir_passeio", _TOURID_RE)] + delete_kinds
     for kind, label, rx in delete_kinds:
+        states = {D_CONFIRM: [CallbackQueryHandler(delete_confirm, pattern=r"^del:")]}
+        if kind == "post":
+            # Estado do picker: escolher um post (del:pick:) ou cancelar (del:no).
+            states[D_PICK] = [CallbackQueryHandler(delete_pick, pattern=r"^del:pick:"),
+                              CallbackQueryHandler(delete_confirm, pattern=r"^del:no$")]
         app.add_handler(ConversationHandler(
             entry_points=[CommandHandler(label, _make_delete_cmd(kind, rx, label))],
-            states={D_CONFIRM: [CallbackQueryHandler(delete_confirm, pattern=r"^del:")]},
+            states=states,
             fallbacks=fallbacks, conversation_timeout=300, name=f"del_{kind}", persistent=_PERSIST,
             allow_reentry=True,
         ))

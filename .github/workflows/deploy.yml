@@ -1,0 +1,34 @@
+name: deploy
+
+# Deploy no Cloud Run a cada push na main. Os serviços já existem (criados por
+# deploy-cloudrun.sh), então `gcloud run deploy --source .` só rebuilda a imagem e
+# publica — PRESERVA env vars, secrets, service account e escala já configurados.
+# A URL do Cloud Run é estável entre deploys, então o setWebhook do Telegram segue
+# sendo um passo único (não precisa refazer aqui).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+# Um deploy por vez; um push novo cancela o anterior em andamento.
+concurrency:
+  group: deploy-cloudrun
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: '${{ secrets.GCP_SA_KEY }}'
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: deploy worker + webhook
+        run: |
+          gcloud run deploy ph-bot-worker  --source . --project pedal-hidrografico --region southamerica-east1 --quiet
+          gcloud run deploy ph-bot-webhook --source . --project pedal-hidrografico --region southamerica-east1 --quiet

@@ -45,6 +45,11 @@ class Config:
     TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     ALLOWED_USERS = _csv_ints(os.environ.get("TELEGRAM_ALLOWED_USERS", ""))
     WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
+    # Senha de acesso: quem enviar (via /senha <senha> ou a senha pura) ganha acesso, mesmo fora
+    # da allowlist estática. O grant fica persistido (Firestore no Cloud Run). Não afrouxa o boot
+    # fail-closed — a allowlist segue obrigatória; a senha é só uma 2ª porta em runtime. Vazia ⇒
+    # porta desligada (só a allowlist vale).
+    ACCESS_PASSWORD = os.environ.get("BOT_ACCESS_PASSWORD", "biciagua")
 
     # ── Backends (clientes HTTP) ──────────────────────────────────────────
     SABIA_BASE_URL = os.environ.get("SABIA_BASE_URL", "http://localhost:8080").rstrip("/")

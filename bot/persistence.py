@@ -102,6 +102,30 @@ class Store:
             return (self._mem.get("publish", {}).get(request_id) or {}).get("result")
         return await _to_thread(self._fs_get_result, "publish", request_id, timeout=_FS_READ_TIMEOUT)
 
+    # ── acesso por senha (grant em runtime, persistido) ──────────────────────
+    # Quem acerta a senha entra na allowlist "dinâmica". Precisa durar entre instâncias/reinícios
+    # (Cloud Run troca de instância; polling reinicia), então vai no Firestore quando há. Sem
+    # expire_at: o acesso é permanente até remoção manual.
+    async def is_granted(self, user_id: "int | None") -> bool:
+        if user_id is None:
+            return False
+        key = str(user_id)
+        if not self._use_fs:
+            return key in self._mem.get("access", {})
+        snap = await _to_thread(lambda: _firestore().collection(_col("access")).document(key).get(),
+                                timeout=_FS_READ_TIMEOUT)
+        return snap.exists
+
+    async def grant_access(self, user_id: int) -> None:
+        key = str(user_id)
+        if not self._use_fs:
+            self._mem.setdefault("access", {})[key] = time.time()
+            return
+        await _to_thread(
+            lambda: _firestore().collection(_col("access")).document(key).set({"ts": time.time()}),
+            timeout=_FS_WRITE_TIMEOUT,
+        )
+
     # ── implementações Firestore (síncronas) ─────────────────────────────────
     def _fs_claim(self, col: str, key: str) -> bool:
         from google.cloud import firestore

@@ -19,7 +19,7 @@ from telegram import Update
 log = logging.getLogger("webhook")
 
 from .config import Config
-from .handlers import build_application
+from .handlers import build_application, refresh_conversations
 from .persistence import Store
 
 _application = None
@@ -61,6 +61,11 @@ async def telegram(request: Request, x_telegram_bot_api_secret_token: str = Head
         if uid is not None and await _store.is_processed(uid):
             return Response(status_code=200)
         async with asyncio.timeout(50):  # < timeout do Telegram (~60 s)
+            # Reidrata o estado da conversa deste update ANTES de despachar: a instância pode não
+            # ser a que iniciou o wizard (o PTB só lê `conversations` no initialize()). Sem isto o
+            # clique do botão cai no catch-all órfão mesmo com estado salvo — botões inline
+            # (/excluir_post, /anuncio…) falhando de forma intermitente.
+            await refresh_conversations(_application, update)
             await _application.process_update(update)
             if _application.persistence is not None and hasattr(_application, "update_persistence"):
                 await _application.update_persistence()  # flush p/ Firestore antes de congelar

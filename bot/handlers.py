@@ -19,6 +19,7 @@ from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
     ApplicationBuilder,
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
@@ -30,7 +31,10 @@ from telegram.ext import (
 from . import jobs, tasks
 from .clients import Amora, BackendError, Sabia
 from .config import Config
-from .persistence import make_persistence
+from .persistence import Store, make_persistence
+
+# Allowlist dinâmica (grant por senha) + marcadores — Firestore no Cloud Run, memória no polling.
+_store = Store()
 
 log = logging.getLogger("pedalbot.handlers")
 
@@ -51,19 +55,51 @@ _IG_RE = re.compile(r"https?://(www\.)?instagram\.com/(p|reel)/[\w-]+", re.I)
 
 
 # ── auth + utilidades ────────────────────────────────────────────────────────
+async def _has_access(uid: "int | None") -> bool:
+    """Allowlist estática (env) OU grant dinâmico por senha (persistido). Curto-circuita a
+    allowlist antes de tocar o Firestore — quem já está no env não paga leitura."""
+    return Config.is_allowed(uid) or await _store.is_granted(uid)
+
+
 def restricted(func):
     @wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *a, **k):
         uid = update.effective_user.id if update.effective_user else None
-        if not Config.is_allowed(uid):
+        if not await _has_access(uid):
             if update.effective_message:
                 await update.effective_message.reply_text(
-                    f"⛔ Acesso negado. Seu ID do Telegram é {uid} — peça pra incluí-lo na allowlist."
+                    f"⛔ Acesso negado. Seu ID do Telegram é {uid} — peça pra incluí-lo na "
+                    "allowlist, ou entre com a senha: /senha <senha>."
                 )
             return ConversationHandler.END
         return await func(update, context, *a, **k)
 
     return wrapper
+
+
+async def cmd_senha(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Porta de acesso por senha: quem acertar entra na allowlist dinâmica (persistida).
+
+    Casa com `/senha <senha>` OU com a senha pura (handler de texto exato). NÃO é `@restricted`
+    — é o próprio portão. Para com `ApplicationHandlerStop` pra não vazar pro wizard/fallback.
+    """
+    msg = update.effective_message
+    text = (msg.text or "") if msg else ""
+    parts = text.split(maxsplit=1)
+    candidate = parts[1].strip() if (parts and parts[0].lstrip("/").startswith("senha") and len(parts) == 2) \
+        else text.strip()
+    # case-insensitive: casa com o filtro de texto (re.I) e perdoa o auto-capitalize do celular.
+    if not Config.ACCESS_PASSWORD or candidate.lower() != Config.ACCESS_PASSWORD.lower():
+        if text.lstrip().startswith("/senha") and msg:
+            await msg.reply_text("Senha incorreta. Use: /senha <senha>")
+        raise ApplicationHandlerStop
+    uid = update.effective_user.id if update.effective_user else None
+    if uid is not None and not await _has_access(uid):
+        await _store.grant_access(uid)
+        log.info("acesso liberado por senha: user=%s", uid)
+    if msg:
+        await msg.reply_text("✅ Senha correta — acesso liberado! Use /start pra começar.")
+    raise ApplicationHandlerStop
 
 
 def _token(context) -> str:
@@ -499,6 +535,9 @@ async def delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(f"🗑️ {kind} {_id} excluído. (por {update.effective_user.id})")
     except BackendError as exc:
         await q.edit_message_text(f"❌ {exc.payload.get('error') or exc}")
+    except Exception as exc:  # noqa: BLE001 - rede/timeout/backend fora do ar: NÃO deixe o botão "morto"
+        log.warning("falha ao excluir %s %s", kind, _id, exc_info=True)
+        await q.edit_message_text(f"❌ Falha ao excluir {kind} {_id}: {exc}")
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -537,17 +576,65 @@ async def fallback_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     que casa roda, então só cai aqui o que nenhum outro tratou. Silencioso p/ quem não está na
     allowlist (não vira beacon p/ estranhos)."""
     uid = update.effective_user.id if update.effective_user else None
-    if not Config.is_allowed(uid):
+    if not await _has_access(uid):
         return
     msg = update.effective_message
     if msg:
         await msg.reply_text("Não entendi 🤔 Mande /start para ver as opções.")
 
 
+async def refresh_conversations(app: Application, update: Update) -> None:
+    """Relê da persistência o estado da conversa DESTE update, antes de despachar.
+
+    No webhook (Cloud Run) a instância é efêmera e o PTB só carrega `conversations` da
+    persistência UMA vez, no `initialize()`. Então o passo do wizard pode rodar numa instância e
+    o clique do botão cair em OUTRA que nunca viu essa conversa: sem isto, o callback vai pro
+    catch-all órfão ("sessão expirou") mesmo com o estado salvo no Firestore — /excluir_post e
+    todo botão inline "não funcionam" de forma intermitente. Aqui a gente relê, por
+    ConversationHandler persistente, só a chave deste update. No polling (persistence=None) é
+    no-op — o estado em memória do processo único já basta.
+
+    Acopla a internals do PTB (`_get_key`/`_conversations`) de propósito: é o único jeito de
+    reidratar o roteamento da conversa por update sem reconstruir a Application inteira.
+    """
+    persistence = app.persistence
+    if persistence is None:
+        return
+    for group in app.handlers.values():
+        for h in group:
+            if not (isinstance(h, ConversationHandler) and h.persistent and h.name):
+                continue
+            try:
+                key = h._get_key(update)  # noqa: SLF001
+            except Exception:  # noqa: BLE001 - update sem chat/user: nada a reidratar
+                continue
+            try:
+                stored = await persistence.get_conversations(h.name)
+            except Exception:  # noqa: BLE001 - Firestore fora do ar: segue com o que há em memória
+                log.warning("não consegui reler conversas de %s", h.name, exc_info=True)
+                continue
+            conv = h._conversations  # noqa: SLF001
+            if key in stored:
+                setter = getattr(conv, "update_no_track", conv.update)
+                setter({key: stored[key]})
+            elif key in conv:
+                conv.pop(key, None)  # encerrada noutra instância: não aja sobre estado morto
+
+
 # ── registro ─────────────────────────────────────────────────────────────────
 def register(app: Application) -> None:
     fallbacks = [CommandHandler("cancelar", cmd_cancelar)]
     timeout = Config.CONVERSATION_TIMEOUT_S
+
+    # Porta de acesso por senha — PRIMEIRO no grupo 0, antes de tudo (não é @restricted; é o
+    # próprio portão). Casa só com `/senha ...` ou com a senha PURA (regex exato, case-insensitive)
+    # p/ não sequestrar texto de wizard. Para com ApplicationHandlerStop, então não vaza adiante.
+    if Config.ACCESS_PASSWORD:
+        app.add_handler(CommandHandler("senha", cmd_senha))
+        app.add_handler(MessageHandler(
+            filters.Regex(re.compile(rf"^\s*{re.escape(Config.ACCESS_PASSWORD)}\s*$", re.I)),
+            cmd_senha,
+        ))
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("ajuda", cmd_ajuda))

@@ -25,6 +25,30 @@ o amora, ajuste o caminho lá.
 - **Cloud Run webhook** (`bot.webhook` + `bot.worker`): estado da conversa no
   **Firestore** (`FirestorePersistence`), trabalho lento via Cloud Tasks.
 
+## Invariante: reidratar a conversa a cada update no webhook
+
+O PTB só lê `conversations` da persistência **uma vez**, no `initialize()`. No
+Cloud Run a instância é efêmera e o autoscaler pode ter **>1 instância quente**:
+o passo do wizard roda numa e o clique do botão cai em **outra**, que nunca viu
+essa conversa → o callback vira órfão ("sessão expirou") **mesmo com o estado
+salvo no Firestore**. Sintoma: `/excluir_post` (e todo botão inline) "não
+funciona" de forma **intermitente** (cold start e mesma-instância funcionam;
+segunda instância quente, não). Por isso `webhook.py` chama
+`handlers.refresh_conversations(app, update)` **antes** de `process_update` —
+relê do Firestore só a chave deste update. No polling (`persistence=None`) é
+no-op. Coberto por `test_webhook_conversation_reload`. **Não** despache um update
+no webhook sem reidratar antes.
+
+## Acesso: allowlist estática + porta por senha
+
+`TELEGRAM_ALLOWED_USERS` (env) é a allowlist dura (fail-closed no boot). Além
+dela, quem enviar a senha (`/senha <senha>` ou a senha pura, case-insensitive)
+entra numa **allowlist dinâmica** persistida (`Store.grant_access`/`is_granted`,
+coleção `access` no Firestore; memória no polling). A senha é `BOT_ACCESS_PASSWORD`
+(default `biciagua`); vazia ⇒ porta desligada. `restricted` consulta as duas via
+`_has_access` (allowlist curto-circuita antes de tocar o Firestore). Coberto por
+`test_password_access`.
+
 ## Invariante: o bot PRECISA estar inscrito em `callback_query`
 
 Botão inline em "Loading…" pra sempre = o update de `callback_query` **nem chega**

@@ -323,6 +323,195 @@ def test_polling_subscription() -> None:
           "allowed_updates=Update.ALL_TYPES" in src)
 
 
+# ── helpers p/ os testes de webhook/acesso (offline, sem rede) ────────────────
+from telegram.request import BaseRequest as _BaseRequest
+
+
+class _FakeRequest(_BaseRequest):  # responde getMe/sendMessage/etc. localmente (sem rede)
+    def __init__(self) -> None:
+        super().__init__()
+        self.api: list[str] = []
+
+    async def initialize(self) -> None: ...
+    async def shutdown(self) -> None: ...
+
+    async def do_request(self, url, method, request_data=None, **kw):
+        import json as _json
+        m = url.rsplit("/", 1)[-1]
+        p = request_data.parameters if request_data else {}
+        self.api.append(m)
+        if m == "getMe":
+            res: object = {"id": 1, "is_bot": True, "first_name": "b", "username": "phbot"}
+        elif m in ("sendMessage", "editMessageText", "editMessageReplyMarkup"):
+            res = {"message_id": 1, "date": 0, "chat": {"id": 1, "type": "private"}, "text": p.get("text", "")}
+        else:
+            res = True
+        return 200, ('{"ok":true,"result":' + _json.dumps(res) + "}").encode()
+
+
+def _fake_firestore():
+    """Um Firestore em memória (dict de coleções) p/ simular o store COMPARTILHADO entre
+    instâncias do Cloud Run."""
+    store: dict = {}
+
+    class Snap:
+        def __init__(self, cid, d): self.id, self._d, self.exists = cid, d, d is not None
+        def to_dict(self): return dict(self._d) if self._d else {}
+
+    class Doc:
+        def __init__(self, col, cid): self.col, self.cid = col, cid
+        def get(self, *a, **k): return Snap(self.cid, store.get(self.col, {}).get(self.cid))
+        def set(self, data, merge=False): store.setdefault(self.col, {})[self.cid] = dict(data)
+        def delete(self): store.setdefault(self.col, {}).pop(self.cid, None)
+
+    class Col:
+        def __init__(self, col): self.col = col
+        def document(self, cid): return Doc(self.col, str(cid))
+        def stream(self): return [Snap(c, d) for c, d in store.get(self.col, {}).items()]
+
+    class FS:
+        def collection(self, name): return Col(name)
+
+    return FS(), store
+
+
+def _cmd_msg(bot, mid, text, chat_id=1, user_id=1):
+    import datetime
+    from telegram import Chat, Message, MessageEntity, User
+    ents = [MessageEntity(type=MessageEntity.BOT_COMMAND, offset=0, length=len(text.split()[0]))] \
+        if text.startswith("/") else None
+    m = Message(message_id=mid, date=datetime.datetime.now(datetime.timezone.utc),
+                chat=Chat(id=chat_id, type="private"),
+                from_user=User(id=user_id, first_name="t", is_bot=False), text=text, entities=ents)
+    m.set_bot(bot)
+    return m
+
+
+def _build_app(persistence=None):
+    from telegram.ext import ApplicationBuilder
+    from bot import handlers as H
+    req = _FakeRequest()
+    b = ApplicationBuilder().token("123456:DUMMY").request(req).get_updates_request(_FakeRequest())
+    if persistence is not None:
+        b = b.persistence(persistence)
+    app = b.build()
+    H.register(app)
+    return app, req
+
+
+# ── 8. Webhook: reidratação da conversa entre instâncias (Cloud Run) ──────────
+def test_webhook_conversation_reload() -> None:
+    """Regressão do 'botão morto' no Cloud Run: o passo do wizard roda numa instância e o clique
+    do botão pode cair em OUTRA. O PTB só lê `conversations` da persistência no initialize(),
+    então sem `handlers.refresh_conversations()` o callback vira órfão ('sessão expirou') mesmo
+    com o estado salvo no Firestore — /excluir_post (e todo botão inline) falhando de forma
+    intermitente. Aqui: instância A abre /excluir_post; instância B (que nunca viu o comando)
+    conclui a exclusão.
+    """
+    import asyncio
+    import warnings
+
+    warnings.simplefilter("ignore")
+    os.environ["TELEGRAM_BOT_TOKEN"] = os.environ.get("TELEGRAM_BOT_TOKEN", "123456:DUMMY")
+    os.environ["AMORA_ENABLED"] = ""
+
+    from telegram import CallbackQuery, Update, User
+
+    from bot import clients as C, handlers as H, persistence as P
+    from bot.config import Config
+
+    print("webhook: reidratação de conversa entre instâncias (Cloud Run):")
+    # Simula o Cloud Run direto: força a persistência (FirestorePersistence com um Firestore
+    # em memória compartilhado) em vez de depender de env — o modo webhook usa exatamente isto.
+    Config.ALLOWED_USERS = frozenset({1})
+    deleted: list[str] = []
+    C.Sabia.list_posts = lambda self: [{"shortcode": "ABC123", "deletable": True}]
+    C.Sabia.delete_post = lambda self, sc: (deleted.append(sc), {"ok": True})[1]
+    fs, store = _fake_firestore()
+    P._fs_client = fs
+    _persist_saved = H._PERSIST
+    H._PERSIST = True
+
+    async def run() -> None:
+        appA, _ = _build_app(P.FirestorePersistence())
+        appB, frB = _build_app(P.FirestorePersistence())
+        await appA.initialize()
+        await appB.initialize()
+
+        updA = Update(update_id=1, message=_cmd_msg(appA.bot, 1, "/excluir_post ABC123"))
+        updA.set_bot(appA.bot)
+        await H.refresh_conversations(appA, updA)
+        await appA.process_update(updA)
+        await appA.update_persistence()
+        check("A persistiu o estado da conversa no Firestore", bool(store.get("phbot_conv_del_post")))
+
+        q = CallbackQuery(id="cb", from_user=User(id=1, first_name="t", is_bot=False),
+                          chat_instance="ci", data="del:yes", message=_cmd_msg(appB.bot, 9, "Confirmar"))
+        q.set_bot(appB.bot)
+        updB = Update(update_id=2, callback_query=q)
+        updB.set_bot(appB.bot)
+        n = len(frB.api)
+        await H.refresh_conversations(appB, updB)
+        await appB.process_update(updB)
+        await appB.update_persistence()
+        check("B (outra instância) executa a exclusão de fato", deleted == ["ABC123"], f"deleted={deleted}")
+        check("B responde editando a msg (não cai no 'sessão expirou')",
+              "editMessageText" in frB.api[n:] and "answerCallbackQuery" in frB.api[n:])
+        await appA.shutdown()
+        await appB.shutdown()
+
+    try:
+        asyncio.run(run())
+    finally:
+        H._PERSIST = _persist_saved
+        P._fs_client = None
+
+
+# ── 9. Acesso por senha (allowlist dinâmica) ──────────────────────────────────
+def test_password_access() -> None:
+    """Regressão do acesso por senha: quem envia a senha (via `/senha <senha>` OU a senha pura,
+    case-insensitive) entra na allowlist dinâmica; senha errada não concede nada."""
+    import asyncio
+    import warnings
+
+    warnings.simplefilter("ignore")
+    os.environ.pop("WORKER_URL", None)
+    os.environ.pop("K_SERVICE", None)
+
+    from telegram import Update
+
+    from bot import handlers as H, persistence as P
+    from bot.config import Config
+
+    print("acesso por senha (allowlist dinâmica):")
+    Config.ALLOWED_USERS = frozenset({1})
+    Config.ACCESS_PASSWORD = "biciagua"
+    Config.WORKER_URL = ""  # garante modo polling (Store em memória) independente da ordem dos testes
+    H._PERSIST = False
+    H._store = P.Store()  # store novo em memória (modo polling)
+
+    async def run() -> None:
+        app, _ = _build_app()
+        await app.initialize()
+        check("estranho (fora da allowlist) começa SEM acesso", not await H._has_access(999))
+
+        async def send(mid, text, uid):
+            m = _cmd_msg(app.bot, mid, text, chat_id=uid, user_id=uid)
+            upd = Update(update_id=mid, message=m)
+            upd.set_bot(app.bot)
+            await app.process_update(upd)
+
+        await send(1, "/senha errada", 999)
+        check("senha errada NÃO concede acesso", not await H._has_access(999))
+        await send(2, "/senha biciagua", 999)
+        check("/senha correta concede acesso", await H._has_access(999))
+        await send(3, "  BICIAGUA ", 888)  # senha pura, com espaços e maiúscula
+        check("senha pura (case-insensitive) concede acesso", await H._has_access(888))
+        await app.shutdown()
+
+    asyncio.run(run())
+
+
 if __name__ == "__main__":
     test_compile()
     test_hashing()
@@ -331,6 +520,8 @@ if __name__ == "__main__":
     test_ttl()
     test_orphan_callback()
     test_polling_subscription()
+    test_webhook_conversation_reload()
+    test_password_access()
     print()
     if _failures:
         print(f"\033[31m{_failures} verificação(ões) falharam\033[0m")

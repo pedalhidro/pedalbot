@@ -9,3 +9,6 @@ venv/
 tmp_media/
 # editor pessoal (cores/preferências locais)
 .vscode/
+# chave de service account do GCP (NUNCA commitar — credencial viva)
+key.json
+*-key.json
